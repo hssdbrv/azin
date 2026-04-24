@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: azin_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: azin
+      POSTGRES_PASSWORD: azinpass
+      POSTGRES_DB: azin_db
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    container_name: azin_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    container_name: azin_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://azin:azinpass@postgres:5432/azin_db
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: development
+      PORT: 4000
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./backend/uploads:/app/uploads
+
+  frontend:
+    build: ./frontend
+    container_name: azin_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "5173:5173"
+
+volumes:
+  pgdata:
