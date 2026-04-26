@@ -32,13 +32,25 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT,
   media_url TEXT,
   media_type TEXT,
+  seen_at TIMESTAMP,
+  seen_by INT REFERENCES users(id),
   created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS contacts (
+  user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  contact_user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at TIMESTAMP DEFAULT NOW(),
+  PRIMARY KEY (user_id, contact_user_id),
+  CHECK (user_id <> contact_user_id)
 );
 
 -- Safe for existing DB:
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_url TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id INT REFERENCES chats(id);
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS seen_at TIMESTAMP;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS seen_by INT REFERENCES users(id);
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS system_key TEXT UNIQUE;
 ALTER TABLE chats ADD COLUMN IF NOT EXISTS private_key TEXT UNIQUE;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;

@@ -10,7 +10,13 @@ import multer from "multer";
 import { pool } from "./db.js";
 import { authMiddleware } from "./auth.js";
 import { setupSocket } from "./socket.js";
+import { redisPub } from "./redis.js";
 import {
+  addContactByUsername,
+  getUserProfileForViewer,
+  listContactsForUser,
+  removeContactByUsername,
+  searchUsersForUser,
   ServiceError,
   createOrGetPrivateChat,
   ensureChatSchema,
@@ -18,7 +24,10 @@ import {
   getChatDetailsForUser,
   getMessagesForChat,
   listChatsForUser,
+  markPrivateMessagesSeen,
 } from "./chat-service.js";
+
+const CHAT_SEEN_CHANNEL = "chat_seen";
 
 const app = express();
 app.use(cors());
@@ -173,6 +182,21 @@ app.get("/chats/:chatId/messages", authMiddleware, async (req, res) => {
   }
 
   try {
+    const seenRows = await markPrivateMessagesSeen(chatId, req.user.id);
+    if (seenRows.length) {
+      await redisPub.publish(
+        CHAT_SEEN_CHANNEL,
+        JSON.stringify({
+          chatId,
+          seenBy: req.user.id,
+          seen: seenRows.map((row) => ({
+            id: row.id,
+            seenAt: row.seen_at,
+          })),
+        })
+      );
+    }
+
     const messages = await getMessagesForChat(chatId, req.user.id);
     res.json(messages);
   } catch (error) {
@@ -214,6 +238,71 @@ app.post("/chats/private", authMiddleware, async (req, res) => {
     }
 
     return res.status(500).json({ error: "Failed to create private chat." });
+  }
+});
+
+app.get("/users/search", authMiddleware, async (req, res) => {
+  const query = req.query?.q;
+
+  try {
+    const users = await searchUsersForUser(req.user.id, query);
+    res.json(users);
+  } catch (error) {
+    res.status(500).json({ error: error?.message || "Failed to search users." });
+  }
+});
+
+app.get("/contacts", authMiddleware, async (req, res) => {
+  try {
+    const contacts = await listContactsForUser(req.user.id);
+    res.json(contacts);
+  } catch (error) {
+    res.status(500).json({ error: error?.message || "Failed to load contacts." });
+  }
+});
+
+app.post("/contacts", authMiddleware, async (req, res) => {
+  const targetUsername = req.body?.username;
+
+  try {
+    const contact = await addContactByUsername(req.user.id, targetUsername);
+    res.json(contact);
+  } catch (error) {
+    if (error instanceof ServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+
+    return res.status(500).json({ error: "Failed to add contact." });
+  }
+});
+
+app.delete("/contacts/:username", authMiddleware, async (req, res) => {
+  const targetUsername = req.params?.username;
+
+  try {
+    const removed = await removeContactByUsername(req.user.id, targetUsername);
+    res.json(removed);
+  } catch (error) {
+    if (error instanceof ServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+
+    return res.status(500).json({ error: "Failed to remove contact." });
+  }
+});
+
+app.get("/users/:username", authMiddleware, async (req, res) => {
+  const username = req.params?.username;
+
+  try {
+    const userProfile = await getUserProfileForViewer(req.user.id, username);
+    res.json(userProfile);
+  } catch (error) {
+    if (error instanceof ServiceError) {
+      return res.status(error.status).json({ error: error.message });
+    }
+
+    return res.status(500).json({ error: "Failed to load user profile." });
   }
 });
 

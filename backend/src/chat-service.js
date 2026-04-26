@@ -58,7 +58,19 @@ export async function ensureChatSchema() {
     );
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS contacts (
+      user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      contact_user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      created_at TIMESTAMP DEFAULT NOW(),
+      PRIMARY KEY (user_id, contact_user_id),
+      CHECK (user_id <> contact_user_id)
+    );
+  `);
+
   await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id INT REFERENCES chats(id);`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS seen_at TIMESTAMP;`);
+  await pool.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS seen_by INT REFERENCES users(id);`);
   await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS system_key TEXT UNIQUE;`);
   await pool.query(`ALTER TABLE chats ADD COLUMN IF NOT EXISTS private_key TEXT UNIQUE;`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;`);
@@ -218,8 +230,9 @@ export async function getChatDetailsForUser(chatId, userId) {
 
 export async function getMessagesForChat(chatId, userId) {
   const membership = await pool.query(
-    `SELECT 1
+    `SELECT c.type
      FROM chat_members
+     JOIN chats c ON c.id = chat_members.chat_id
      WHERE chat_id = $1 AND user_id = $2`,
     [chatId, userId]
   );
@@ -230,6 +243,7 @@ export async function getMessagesForChat(chatId, userId) {
 
   const messages = await pool.query(
     `SELECT m.id, m.chat_id, m.content, m.media_url, m.media_type, m.created_at,
+            m.seen_at, m.seen_by,
             u.username, u.full_name, u.avatar_url
      FROM messages m
      JOIN users u ON u.id = m.user_id
@@ -239,6 +253,40 @@ export async function getMessagesForChat(chatId, userId) {
   );
 
   return messages.rows;
+}
+
+export async function markPrivateMessagesSeen(chatId, userId) {
+  const membership = await pool.query(
+    `SELECT c.type
+     FROM chat_members cm
+     JOIN chats c ON c.id = cm.chat_id
+     WHERE cm.chat_id = $1
+       AND cm.user_id = $2
+     LIMIT 1`,
+    [chatId, userId]
+  );
+
+  const chat = membership.rows[0];
+  if (!chat) {
+    throw new ServiceError(404, "Chat not found.");
+  }
+
+  if (chat.type !== "private") {
+    return [];
+  }
+
+  const updated = await pool.query(
+    `UPDATE messages
+     SET seen_at = NOW(),
+         seen_by = $2
+     WHERE chat_id = $1
+       AND user_id <> $2
+       AND seen_at IS NULL
+     RETURNING id, seen_at`,
+    [chatId, userId]
+  );
+
+  return updated.rows;
 }
 
 export async function createOrGetPrivateChat(userId, targetUsername) {
@@ -313,6 +361,170 @@ export async function createOrGetPrivateChat(userId, targetUsername) {
   }
 
   return getChatDetailsForUser(chatId, userId);
+}
+
+export async function searchUsersForUser(userId, queryText) {
+  const query = String(queryText || "").trim();
+  if (query.length < 2) return [];
+
+  const result = await pool.query(
+    `SELECT u.id,
+            u.username,
+            u.full_name,
+            u.avatar_url,
+            u.bio,
+            (c.user_id IS NOT NULL) AS is_contact,
+            dm.id AS private_chat_id
+     FROM users u
+     LEFT JOIN contacts c
+       ON c.user_id = $1
+      AND c.contact_user_id = u.id
+     LEFT JOIN chats dm
+       ON dm.type = 'private'
+      AND dm.private_key = CONCAT(LEAST($1, u.id), ':', GREATEST($1, u.id))
+     WHERE u.id <> $1
+       AND (u.username ILIKE $2 OR u.full_name ILIKE $2)
+     ORDER BY
+       CASE WHEN u.username ILIKE $3 THEN 0 ELSE 1 END,
+       u.username ASC
+     LIMIT 20`,
+    [userId, `%${query}%`, `${query}%`]
+  );
+
+  return result.rows;
+}
+
+export async function listContactsForUser(userId) {
+  const result = await pool.query(
+    `SELECT u.id,
+            u.username,
+            u.full_name,
+            u.avatar_url,
+            u.bio,
+            c.created_at,
+            dm.id AS private_chat_id
+     FROM contacts c
+     JOIN users u
+       ON u.id = c.contact_user_id
+     LEFT JOIN chats dm
+       ON dm.type = 'private'
+      AND dm.private_key = CONCAT(LEAST($1, u.id), ':', GREATEST($1, u.id))
+     WHERE c.user_id = $1
+     ORDER BY LOWER(u.full_name) ASC, u.username ASC`,
+    [userId]
+  );
+
+  return result.rows;
+}
+
+export async function addContactByUsername(userId, targetUsername) {
+  const username = String(targetUsername || "").trim();
+  if (!username) {
+    throw new ServiceError(400, "A username is required.");
+  }
+
+  const userResult = await pool.query(
+    `SELECT id, username, full_name, avatar_url, bio
+     FROM users
+     WHERE username = $1`,
+    [username]
+  );
+  const target = userResult.rows[0];
+
+  if (!target) {
+    throw new ServiceError(404, "User not found.");
+  }
+
+  if (target.id === userId) {
+    throw new ServiceError(400, "You cannot add yourself to contacts.");
+  }
+
+  await pool.query(
+    `INSERT INTO contacts (user_id, contact_user_id)
+     VALUES ($1, $2)
+     ON CONFLICT DO NOTHING`,
+    [userId, target.id]
+  );
+
+  const privateChat = await pool.query(
+    `SELECT id
+     FROM chats
+     WHERE type = 'private'
+       AND private_key = CONCAT(LEAST($1, $2), ':', GREATEST($1, $2))
+     LIMIT 1`,
+    [userId, target.id]
+  );
+
+  return {
+    ...target,
+    private_chat_id: privateChat.rows[0]?.id || null,
+  };
+}
+
+export async function removeContactByUsername(userId, targetUsername) {
+  const username = String(targetUsername || "").trim();
+  if (!username) {
+    throw new ServiceError(400, "A username is required.");
+  }
+
+  const userResult = await pool.query(
+    `SELECT id
+     FROM users
+     WHERE username = $1`,
+    [username]
+  );
+  const target = userResult.rows[0];
+
+  if (!target) {
+    throw new ServiceError(404, "User not found.");
+  }
+
+  if (target.id === userId) {
+    throw new ServiceError(400, "You cannot remove yourself from contacts.");
+  }
+
+  await pool.query(
+    `DELETE FROM contacts
+     WHERE user_id = $1
+       AND contact_user_id = $2`,
+    [userId, target.id]
+  );
+
+  return { username };
+}
+
+export async function getUserProfileForViewer(viewerId, targetUsername) {
+  const username = String(targetUsername || "").trim();
+  if (!username) {
+    throw new ServiceError(400, "A username is required.");
+  }
+
+  const result = await pool.query(
+    `SELECT u.id,
+            u.username,
+            u.full_name,
+            u.avatar_url,
+            u.bio,
+            (c.user_id IS NOT NULL) AS is_contact,
+            dm.id AS private_chat_id
+     FROM users u
+     LEFT JOIN contacts c
+       ON c.user_id = $1
+      AND c.contact_user_id = u.id
+     LEFT JOIN chats dm
+       ON dm.type = 'private'
+      AND dm.private_key = CONCAT(LEAST($1, u.id), ':', GREATEST($1, u.id))
+     WHERE u.username = $2
+     LIMIT 1`,
+    [viewerId, username]
+  );
+
+  const user = result.rows[0];
+  if (!user) {
+    throw new ServiceError(404, "User not found.");
+  }
+
+  return user;
 }
 
 export async function listUserChatIds(userId) {

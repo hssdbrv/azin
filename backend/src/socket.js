@@ -1,8 +1,9 @@
 import { Server } from "socket.io";
 import { redis, redisPub, redisSub } from "./redis.js";
-import { createMessage, isUserInChat, listUserChatIds } from "./chat-service.js";
+import { createMessage, isUserInChat, listUserChatIds, markPrivateMessagesSeen } from "./chat-service.js";
 
 const CHAT_CHANNEL = "chat_message";
+const CHAT_SEEN_CHANNEL = "chat_seen";
 
 function parseJson(raw) {
   if (!raw) return null;
@@ -118,6 +119,14 @@ export function setupSocket(server) {
     io.to(roomName(chatId)).emit("message", message);
   });
 
+  redisSub.subscribe(CHAT_SEEN_CHANNEL, (rawMessage) => {
+    const payload = parseJson(rawMessage);
+    const chatId = toInt(payload?.chatId);
+    if (!chatId) return;
+
+    io.to(roomName(chatId)).emit("messages:seen", payload);
+  });
+
   io.on("connection", (socket) => {
     socket.on("presence:join", withSocketGuard(async ({ user }) => {
       const normalizedUser = normalizePresenceUser(user);
@@ -209,6 +218,29 @@ export function setupSocket(server) {
       };
 
       await redisPub.publish(CHAT_CHANNEL, JSON.stringify(payload));
+    }));
+
+    socket.on("chat:seen", withSocketGuard(async ({ chatId }) => {
+      const parsedChatId = toInt(chatId);
+      if (!parsedChatId) return;
+
+      const socketUser = await readSocketUser(socket.id);
+      if (!socketUser?.id) return;
+
+      const seenRows = await markPrivateMessagesSeen(parsedChatId, socketUser.id);
+      if (!seenRows.length) return;
+
+      await redisPub.publish(
+        CHAT_SEEN_CHANNEL,
+        JSON.stringify({
+          chatId: parsedChatId,
+          seenBy: socketUser.id,
+          seen: seenRows.map((row) => ({
+            id: row.id,
+            seenAt: row.seen_at,
+          })),
+        })
+      );
     }));
 
     socket.on("disconnect", withSocketGuard(async () => {
